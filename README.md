@@ -1,5 +1,6 @@
-# Nagiec2025
-Scripts for re-creating figures and analyses related to Nagiec et al.
+# Nagiec et al. (2025)
+
+>Scripts for re-creating figures and analyses related to Nagiec et al.
 
 Here, we describe the statistical analyses of transcriptomics, metabolomics and proteomics data.
 See [methods.md](https://github.com/abcwcm/Nagiec2025/blob/main/methods.md) for a verbose write-up and the individual .Rmd files for details.
