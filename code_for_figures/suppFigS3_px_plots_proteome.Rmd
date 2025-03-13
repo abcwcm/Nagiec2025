@@ -1,0 +1,566 @@
+---
+title: "Identifying differentially expressed proteins"
+author: "Friederike Duendar"
+editor: "Michal Nagiec"
+date: "3/28/2019"
+output:
+    html_document:
+      toc: true
+      toc_depth: 4
+      toc_float: true
+      code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE)
+```
+
+```{r cache=FALSE}
+options(stringsAsFactors = FALSE)
+library(magrittr)
+library(data.table)
+library(readxl)
+library(ggplot2)
+```
+
+>These data sets focus on one time point where we have three replicates built into the experiment and usually comparing three experimental conditions.
+> A data set comparing **MCF10A cells (control, ERK-DN expressing and TGF-beta treated)**. 
+>In the sheet you will see that the raw data is in columns E-M and further normalized in the following columns.
+>E-G are EV replicates, H-J are DN replicates and K-M are TGF replicates.
+
+# Reading in the data
+
+```{r}
+## preparing the reading of the xls file
+filename <-  "DNvTGF_tPx_PC2.xlsx"
+xls_path <- paste0(filename)
+```
+
+```{r}
+## reading in the xls file
+prots.in <- readxl::read_excel(xls_path, sheet = 1, col_names = TRUE, skip = 0) %>% data.table
+names(prots.in)
+```
+
+```{r}
+# we need to remove empty spaces etc. to make the column names compatible with other R functions
+setnames(prots.in, names(prots.in), make.names(names(prots.in)))
+
+# remove the second Gene ID column at the end of the table
+prots.in <- prots.in[, -"Gene__1"  , with=FALSE]
+```
+
+
+Turning the wide table into a long format:
+
+```{r}
+prots <- melt.data.table(prots.in, id.vars = 1:4) # id.vars should specify the columns with details that are common to a single protein, i.e. Protein IDs, Number of peptides
+prots
+```
+
+The `variable` column now contains the headers of the columns with values.
+
+```{r}
+unique(prots$variable)
+# we don't want factors for the experiment names yet
+prots$variable <- as.character(prots$variable)
+# only keep the __raw__ values for now -- these are stored in the rows corresponding to variables that start with "X"
+prots <- prots[variable %in% grep("^X", unique(prots$variable), value = TRUE)]
+# change the gene column header
+setnames(prots, "Gene", "gene_symbol")
+```
+
+## Cleaning the data
+
+```{r}
+# remove lines without protein IDs
+prots <- prots[!is.na(Protein.Id)]
+```
+
+### Checking and removing contaminants
+
+```{r}
+prots[grepl("ACHLY", Protein.Id)]
+prots <- prots[!grepl("ACHLY", Protein.Id)]
+```
+
+```{r}
+prots[!grep("^sp", Protein.Id)]
+prots <- prots[grep("^sp", Protein.Id)]
+```
+
+```{r}
+prots[!grepl("HUMAN", Protein.Id)]
+prots <- prots[grepl("HUMAN",Protein.Id)]
+```
+
+## Adding sample information
+
+```{r}
+# defining samples based on the printed names
+sample_names <- c("EV1","EV2","EV3","DN1","DN2","DN3","TGFB1","TGFB2","TGFB3")
+col_names <- unique(prots$variable) 
+samples <- data.table(sample = sample_names,
+                      condition = gsub("[0-9]","", sample_names),
+                      variable = col_names)
+samples
+```
+
+Joining the sample info table with the raw values
+
+```{r}
+prots <- samples[prots, on = "variable"]
+```
+
+```{r eval=FALSE}
+#saveRDS(prots, file ="protein_quant_ERKvsTGB_2019-03-27_exp2.RDS")
+```
+
+
+# Normalization
+
+Jan Krumsiek first applies a protein-focussed median polish, followed by the calculation of a dilution factor where
+`d = median(value/median(protein))`.
+
+```
+# get the median value for every protein [molecules are stored in columns here]
+  ref <- apply(X, 1, function(x) median(x,na.rm=T))
+
+# get dilution factors (per sample)
+  d <- apply(X, 2,  function(s) median(as.numeric(s/ref),na.rm=T))
+
+# apply to each sample (for each row=sample, divide values by median dilution factor)
+  Y = sapply(1:dim(X)[2], function(i)unlist(X[,i]/d[i]))
+```
+
+```{r}
+make_KrumScript_matrix <- function(in.dt, which_ID = "metabolite", which_value = "value"){
+
+  if(which_ID == which_value){stop("which_ID and which_value must specify different columns.")}
+
+  ABCutilities::check_columns(c("sample",which_ID, which_value), in.dt, "in.dt", "make_KrumScript_matrix")
+
+  km <- data.table::dcast(in.dt[, c("sample",which_ID, which_value), with = FALSE],
+                          as.formula(paste0("sample~", which_ID)),
+                          value.var = which_value) %>% data.frame()
+  rownames(km) <- make.names(km$sample)
+  colnames(km) <- make.names(names(km))
+  km$sample <- NULL
+  return(km)
+}
+```
+
+```{r}
+medianNorm_metabolites <- function(X, batches = NULL){
+
+  if (is.null(batches)){
+    message("No batches given, therefore we will use the median per molecule across all samples.")
+    #batches <- ""
+    X <- apply(X, 2, function(c){ c / median(c,na.rm=T)})
+  }else{
+    if(length(batches) != dim(X)[1]){
+      stop("The batches vector should indicate the batch for every sample (row) of X.")
+    }
+   for (i in 1:length(levels(batches))) {
+    batch <- levels(batches)[i]
+    # median normalize every metabolite within the same batch
+    Xnorm = apply(X[batches==batch,], 2, function(c){ c / median(c,na.rm=T)})
+    X[batches==batch,] = Xnorm
+   }
+  }
+
+  return(X)
+}
+
+```
+
+```{r}
+quotNorm = function(X, vars=1:dim(X)[2], NAerror=F, refsamples=NA) {
+  # x:          data frame to be normalized
+  # vars:       index vector of variables o be used, default: all
+  # NAerrors:   throw error for NA's or just ignore?
+  # refsamples: indices of samples to calculate reference sample on (e.g. only on control samples)
+  
+  # crash if there are any negative values
+  if (any(X[!is.na(X)]<0)) stop("Matrix contains negative values. Did you input logged data?")
+  
+  # check if there are any NAs
+  if (sum(is.na(X[,vars]))>0) {
+    # throw warning or error?
+    if (NAerror) {
+      stop('Data matrix contains NAs')
+    } else {
+      warning('Data matrix contains NAs')
+    }
+  }
+  
+  # if reference samples not given -> all samples
+  if (any(is.na(refsamples))) refsamples <- 1:nrow(X)
+  
+  # median reference sample
+  ref = apply(X[refsamples,vars],2,function(x)median(x,na.rm=T))
+  # get dilution factors
+  d = apply(X[,vars],1,  function(s) median(as.numeric(s/ref),na.rm=T))
+  # apply to each sample  (for each row=sample, divide values by median dilution factor)
+  Y = t(sapply(1:dim(X)[1], function(i)unlist(X[i,]/d[i])))
+  
+  #Y = t(apply(X,1,  function(s) s /  d) )
+  rownames(Y) = rownames(X)
+  
+  # return
+  list(X=Y,dilution=d)
+}
+
+```
+
+```{r jan_norm}
+norm_matrix_list <- list()
+## need to transform the long data.table into a matrix where rows correspond to samples
+norm_matrix_list$ori.value <- make_KrumScript_matrix(prots,
+                                                     which_ID = "Uniprot",
+                                                     which_value = "value") 
+## normalize protein range per MS run (=batch)
+norm_matrix_list$median_norm <- medianNorm_metabolites(norm_matrix_list$ori.value, 
+                                                                  batches = NULL # we don't have different MS runs here!
+                                                                  )
+## adjust sample ranges
+norm_matrix_list$quot_norm <-quotNorm(norm_matrix_list$median_norm ) %>% .$X
+
+# turn into data.tables
+combi.dt <- lapply(seq_along(norm_matrix_list), function(i){
+  dt <- reshape2::melt(as.matrix(norm_matrix_list[[i]]))
+  dt <- as.data.table(dt)
+  setnames(dt, c("Var1","Var2"), c("sample", "uniprot"))
+  dt$type <- names(norm_matrix_list[i])
+  return(dt)
+  }
+  ) %>% rbindlist %>% dcast(., uniprot + sample ~ type, value.var = "value")
+
+combi.dt <- combi.dt[samples, on = "sample"][!is.na(ori.value)]
+
+```
+
+```{r define_colors}
+condition_cols <- c("turquoise","dodgerblue1","navyblue")
+replicate_cols <- c("violetred1","violet", "purple") 
+```
+
+```{r eval=FALSE}
+saveRDS(combi.dt,file ="protein_quant_normalized_ERKvsTGB_2019-03-27_exp2)
+```
+
+# Differential protein analysis
+
+```{r}
+library(limma)
+```
+
+For limma, we will need a matrix in wide format again.
+
+```{r}
+prot.mat <- dcast(combi.dt,  uniprot ~ sample, value.var = "quot_norm") %>% as.data.frame
+row.names(prot.mat) <- prot.mat$uniprot
+prot.mat$uniprot <- NULL
+prot.mat <- as.matrix(prot.mat)
+head(prot.mat)
+```
+
+### Design matrix
+
+Then, we need to define the conditions that we're going to compare.
+
+```{r}
+cnames <- colnames(prot.mat)
+grps <- factor(gsub('[1-3]$', '', cnames))
+grps
+#[1] DN   DN   DN   EV   EV   EV   TGFB TGFB TGFB
+#Levels: DN EV TGFB
+#sub.matDN <- prot.mat[, grep("DN|EV", colnames(prot.mat), value = TRUE), drop = FALSE]
+#sub.matTGFB <- prot.mat[, grep("TGFB|EV", colnames(prot.mat), value = TRUE), drop = FALSE]
+#cnames <- colnames(sub.mat)
+```
+
+The design.matrix is an integral component of limma; if you want to understand the
+rationale behind this, I recommend the chapters on Matrix Algebra and Linear Models
+from the book [Data Analysis for the Life Sciences by Rafa Irizarry and Michael Love](https://leanpub.com/dataanalysisforthelifesciences).
+
+The design matrix is meant to capture which sample belongs to which condition.
+
+```{r}
+design.matrix <- model.matrix(~ 0 + grps)
+colnames(design.matrix) <- as.character(levels(grps))
+row.names(design.matrix) <- cnames
+design.matrix
+```
+
+### Contrast matrix
+
+In addition, we need the `contrast.matrix`
+```{r}
+#limma::makeContrasts( (DN-EV)-(TGFB-EV) , levels = design.matrix)
+contrast.matrix <- limma::makeContrasts(DN-TGFB, DN-EV, TGFB-EV, levels = design.matrix)
+contrast.matrix
+```
+
+
+### Perform the DE analysis
+
+Now, we have everything we need:
+
+* a matrix of values where rows are proteins and columns are samples (`prot.mat`)
+* a design matrix where every row corresponds to the samples of `prot.mat`
+* a contrast matrix to specify how the log2FC values are supposed to be calculated
+
+```{r}
+pm <- as.matrix(prot.mat)
+## replace NA values with a small pseudo-value
+pm[is.na(pm)] <- log2(2^(min(pm, na.rm = TRUE))/2)
+
+## fit the linear model to the observed values
+fit <- limma::lmFit(pm, design.matrix)
+## estimate the coefficients of the model, i.e. generating logFC values
+fit2 <- limma::contrasts.fit(fit, contrast.matrix)
+## perform the statistical test of whether the logFC is "far away" from zero
+## for a given protein
+fit2 <- limma::eBayes(fit2)
+## extract the results: return all proteins that pass the q-value cut-off
+```
+
+
+```{r prep_extraction_of_DP}
+# make a data.table with additional identifiers that will be added to the proteins
+# of interest later on
+prot_anno <- prots[, c("Protein.Id","Uniprot","gene_symbol"), with=FALSE] %>% unique
+prot_anno$protein <- gsub(".+\\|([A-Z0-9]+)_HUMAN$", "\\1", prot_anno$Protein.Id)
+head(prot_anno)
+
+#' @title Extract differentially expressed proteins
+#'
+#' @description A wrapper around limma::topTable to extract molecules with sign.
+#' changes for a certain comparison which is selected via \code{coefficient}.
+#'
+#' @param limma_fit2 The result of limma::eBayes
+#' @param coefficient which contrast to extract, can be the name of a contrast
+#' as defined in `\code{colnames(contrast.matrix)} or an integer indicating 
+#' the column of \code{contrast.matrix} that should be used.
+#' @param p_val_threshold set the maxmimum p-value that you will be willing to 
+#' accept for determining significantly changed molecules
+#' @param p_val_adj_method Specify the type of adjustment for multiple hypothesis
+#' testing. Default: "BH"; other options include: "BY", "holm","hochberg", "hommel", "bonferroni"
+#' @param annotation_dt a data.table with additional identifiers for the proteins;
+#' should have a column named "Uniprot" so that it can be merged with the limma
+#' output
+#' @examples \dontrun{
+#' 
+#' }
+extract_DP <- function(limma_fit2, coefficient, p_val_threshold, p_val_adj_method = "BH", annotation_dt){
+  
+  ## determine whether the annotation_dt can be used
+  add_anno <- TRUE
+  if(!"Uniprot" %in% names(annotation_dt)){
+    warning("The object supplied via annotation_dt does not contain a column named
+            'Uniprot'. This would be needed to add the information to the limma 
+            output; since it is missing, the original limma output will be returned
+            as a data.table.")
+    add_anno <- FALSE
+  }
+  
+  ## extract the limma results and turn them into a data.table
+  results <- limma::topTable(limma_fit2, coef = coefficient, 
+                             adjust = p_val_adj_method, p.value = p_val_threshold,
+                             number=Inf)
+  results <- as.data.table(results, keep.rownames = TRUE)
+  setnames(results, "rn", "Uniprot")
+  
+  ## add annotation if applicable
+  if(isTRUE(add_anno)){
+    results <- annotation_dt[results, on = "Uniprot"]
+  }
+  
+  return(results)
+}
+```
+
+```{r}
+## extracting DN vs EV
+dp_res_DN_vs_EV <- extract_DP(fit2, coefficient = 2, p_val_threshold = 0.001, p_val_adj_method = "BH", annotation_dt = prot_anno)
+
+## extracting TGFB vs EV
+dp_res_TGFB_vs_EV <- extract_DP(fit2, coefficient = 3, p_val_threshold = 0.001, p_val_adj_method = "BH", annotation_dt = prot_anno)
+```
+
+```{r write_to_xlsx, eval=FALSE}
+## save XLS worksheets
+library(openxlsx)
+wb <- createWorkbook()
+addWorksheet(wb, "EV_vs_DN")
+addWorksheet(wb, "EV_vs_TGFB")
+
+writeData(wb, "EV_vs_DN", dp_res_DN_vs_EV,rowNames=FALSE)
+writeData(wb, "EV_vs_TGFB", dp_res_TGFB_vs_EV, rowNames=FALSE)
+```
+
+#### Comparing DN vs TGFB DP
+
+```{r comparison_venn, fig.width=5, fig.height=5}
+## Venn diagram
+#decideTests(fit2, p.value = 0.001) %>% limma::vennDiagram()
+
+decideTests(fit2, p.value = 0.001)[,2:3]  %>% limma::vennDiagram()
+```
+
+* There are 799 (29 + 770) DP shared between TGFB and DN (= intersect).
+* 2405 are changed in either one: 770 + 29 + 987 + 241 + 96 + 282 (= union of TGFB-EV and DN-EV).
+
+```{r}
+## extracting the DP shared between DN-EV and TGFB-EV
+DP_intersect <- merge(dp_res_DN_vs_EV, dp_res_TGFB_vs_EV, 
+                      by=c("protein", "Protein.Id", "Uniprot","gene_symbol"), 
+                      all=FALSE) # previously named output: "merged_allFalse"
+nrow(DP_intersect)
+## replace .x with "DN" and .y with "TGFB" -- this relies on the order of the merge
+## command!
+setnames(DP_intersect, grep("\\.x$", names(DP_intersect), value = TRUE), gsub("x$", "DN", grep("\\.x$", names(DP_intersect), value = TRUE)))
+setnames(DP_intersect, grep("\\.y$", names(DP_intersect), value = TRUE), gsub("y$", "TGFB", grep("\\.y$", names(DP_intersect), value = TRUE)))
+
+## extracting the **universe** of DP that are changed in either comparison
+DP_union <- merge(dp_res_DN_vs_EV, dp_res_TGFB_vs_EV,
+                  by=c("protein", "Protein.Id", "Uniprot","gene_symbol"),
+                  all=TRUE) # previously named output: merged
+nrow(DP_union)
+setnames(DP_union, grep("\\.x$", names(DP_union), value = TRUE), gsub("x$", "DN", grep("\\.x$", names(DP_union), value = TRUE)))
+setnames(DP_union, grep("\\.y$", names(DP_union), value = TRUE), gsub("y$", "TGFB", grep("\\.y$", names(DP_union), value = TRUE)))
+
+```
+
+
+```{r write_to_xlsx2, eval=FALSE}
+addWorksheet(wb, "intersect_TGFB_and_DN")
+addWorksheet(wb, "union_TGFB_and_DN")
+writeData(wb, "intersect_TGFB_and_DN", DP_intersect, rowNames=FALSE)
+writeData(wb, "union_TGFB_DN", DP_union, rowNames=FALSE)
+saveWorkbook(wb, "~/Dropbox/tetERK ABC/Px/Paola 3x Data/Total/Analysis/totalPx_exp2_p001.xlsx", overwrite=T)
+```
+
+
+```{r}
+## combi.dt contains the original, normalized values that were used for the limma
+## comparisons
+##
+## to add protein and gene names to the combi.dt:
+setnames(combi.dt, "uniprot", "Uniprot")
+combi.dt <- prot_anno[combi.dt, on = "Uniprot"]
+```
+
+
+## DN vs. EV
+ 
+```{r}
+## extract all the proteins with log2FC and stats values
+dp_all_DN <- extract_DP(fit2, coefficient = 2,
+                     p_val_threshold = 1, p_val_adj_method = "BH", annotation_dt = prot_anno)
+
+## add information to the limma object to make use of limma's plots
+fit2$genes$ID <- rownames(fit2) ## uniprot IDs
+fit2$genes$Status <- ifelse(fit2$genes$ID %in% dp_res_DN_vs_EV$Uniprot, "sig.diff.inDN", "n.s.")
+
+## if you want the protein names instead:
+tmp <- data.frame(protein = prot_anno$protein, row.names= prot_anno$Uniprot)
+fit2$genes$ID <- tmp[rownames(fit2),]
+```
+
+
+
+
+## Heatmap
+
+For the heatmap, we will need the original values per samples (in their normalized
+form). That data is kept in `combi.dt`.
+
+```{r hm_prep}
+## first, we need to get the data into a wide format
+hm.mat <- dcast(combi.dt,  gene_symbol + Uniprot ~ sample, value.var = "quot_norm") %>% as.data.frame
+row.names(hm.mat) <- paste(hm.mat$gene_symbol, hm.mat$Uniprot, sep = "_")
+#head(hm.mat)
+#dim(hm.mat)
+
+## Heatmaps with **all** proteins
+#pheatmap::pheatmap(hm.mat[, -c(1:2)], scale = "row", show_rownames = FALSE)
+# turning off the clustering for the samples:
+#pheatmap::pheatmap(hm.mat[, -c(1:2)], scale = "row", cluster_cols = FALSE, show_rownames = FALSE)
+```
+
+If you want to generate a heatmap for just a subset of genes, those can be chosen
+via the `subset` command.
+
+```{r hm_intersect_TGFB_DN, fig.height = 10, fig.width=5}
+## subsetting the matrix to proteins of interest, e.g. those that are part of
+## the intersection of TGFB and DN
+hm.mat_DPintersect <- subset(hm.mat, Uniprot %in% DP_intersect$Uniprot)
+nrow(hm.mat_DPintersect)
+hm.mat_DPintersect$gene_symbol <- NULL
+hm.mat_DPintersect$Uniprot <- NULL
+
+## heatmap plotting & clustering
+hm_clust <- pheatmap::pheatmap(hm.mat_DPintersect, scale = "row", color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdBu")))(100), fontsize_row = 1, cutree_rows = 3, show_rownames = F)
+```
+
+```{r hm_extract_clusters, eval=FALSE}
+## extract cluster IDs
+## the number here should be the same as for cutree_rows in the pheatmap command
+clusters <- cutree(hm_clust$tree_row, 3)
+
+data.frame(cluster = clusters, 
+           gene_symbol = gsub("_.*","", names(clusters)),
+           uniprot = gsub(".*_","",names(clusters))) %>% 
+  write.table(file = "DP_clusters_exp2_p001_cut3v2.txt", sep = "\t", quote = F)
+```
+
+# Over-representation analyses
+
+For over-representation analyses, we’re going to compare the following groups (“clusters”):
+
+genes whose proteins show changes in both TGFB and DN
+up
+down
+clusterCompare needs a list of entrez IDs for each group.
+
+
+```{r}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+columns(org.Hs.eg.db)
+```
+
+```{r}
+anno_entrez <- select(org.Hs.eg.db, keys = unique(dp_all_DN$Uniprot), 
+                      columns = c("ENTREZID", "SYMBOL"), keytype = "UNIPROT") %>% as.data.table
+setnames(anno_entrez, c("UNIPROT"), c("Uniprot"))
+
+## add ENTREZ entries to the data.tables with the shared DP
+DP_intersect <- anno_entrez[DP_intersect, on = "Uniprot"]
+```
+
+
+```{r}
+clstcomp.list <- list(up = unique(DP_intersect[logFC.DN > 0 & logFC.TGFB > 0]$ENTREZID),
+                      down = unique(DP_intersect[logFC.DN < 0 & logFC.TGFB < 0]$ENTREZID))
+
+univ.entrez <-  anno_entrez[Uniprot %in% unique(prots$Uniprot)]$ENTREZID %>% unique
+```
+
+
+```{r}
+library(clusterProfiler)
+ck.GO_cc <- compareCluster(clstcomp.list, fun = "enrichGO", OrgDb = org.Hs.eg.db, ont = "CC", universe = univ.entrez)  
+```
+
+
+```{r, fig.width=5, fig.width=5}
+dotplot(ck.GO_cc) + 
+  ggtitle("Over-represented GO terms (CC)",
+          subtitle="proteins changed in DN & TGFB") +
+   scale_color_gradientn(colours =rev(c("darksalmon", "firebrick3", "firebrick4")))
+```
