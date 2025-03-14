@@ -28,10 +28,18 @@ Gene set overrepresentation analyses
 To determine overrepresented gene sets as shown in the manuscripts, we used the R package [`clusterProfiler`](https://pubmed.ncbi.nlm.nih.gov/22455463/) with the functions `compareCluster()` and `enricher()` and the gene sets as defined by the [MSigDB Hallmark gene set](https://pubmed.ncbi.nlm.nih.gov/22455463/) (MSigDB database v6).
 For visualization, the clusterProfiler functions `cnetplot()`, `heatplot()`, and `dotplot()` were used. 
 
-Proteomics
+Proteomics: Identifying significantly changing proteins
 ==============
 
-Identifying significantly changing proteinsThe protein abundances were loadedinto R and re-normalized, using a method established in the Krumsiek Lab. In brief, for every protein, its median abundances across all samples is determined, followed by a dilution factor, which is based on the median-normalized values. For details, see SuppFigS3_px_plots_proteome.Rmd in the github repo.To identify proteins with statistically significantlychanging values across the different conditions, the limma package was used [Ref]. Missing values were replaced with a pseudo-value (log2(2^min(<observed values>))/2) before limma::lmFit was used to fit a linear model to the observed protein abundances over all replicates and samples of interest. LogFC values were obtained via estimating the coefficients of the model and statistical significantly changing proteins were identified via limma::eBayes() function and limma::topTable() with Benjamini-Hochberg correction for multiple testing and a defined p value cut-off of 0.1 for results presented in Supplementary Figure S3 and 0.05 for the time course analyses.ClusteringTo identify groups of proteins with similar changes over time, we applied kNN-based clustering to the logFC values for DN-vs-YA as calculated by limma (described in previous paragraph): igraph::cluster_walktrap(scran::buildSNNGraph(t(prots.lf), k =40))
+The protein abundances as calculated by the Dephoure Lab were loaded into R and re-normalized, using a method established in the Krumsiek Lab (see [src/](src/).
+In brief, for every protein, its median abundances across all samples is determined, followed by a dilution factor, which is based on the median-normalized values.
+For details, see [SuppFigS3_px_plots_proteome.Rmd](code_for_figures/SuppFigS3_px_plots_proteome.Rmd) in the github repo.
+To identify proteins with statistically significantlychanging values across the different conditions, the limma package was used. Missing values were replaced with a pseudo-value (log2(2^min(<observed values>))/2) before limma::lmFit() was used to fit a linear model to the observed protein abundances over all replicates and samples of interest.
+LogFC values were obtained via estimating the coefficients of the model and statistically significantly changing proteins were identified via limma::eBayes() and limma::topTable() with Benjamini-Hochberg correction for multiple testing and a defined p value cut-off of 0.1 for results presented in Supplementary Figure S3 and 0.05 for the time course analyses.
+
+### Clustering
+
+To identify groups of proteins with similar changes over time, we applied kNN-based clustering to the logFC values for DN-vs-YA as calculated by limma (described in previous paragraph): igraph::cluster_walktrap(scran::buildSNNGraph(t(prots.lf), k =40))
 
 Metabolites
 ==============
